@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+*.gdb/
+*.sde
+*.lock
+logs/
+*.log
+.env
+*.env
+credentials*
+*token*
