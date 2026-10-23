@@ -43,7 +43,7 @@ answer per check id. Nothing is written without --apply.
 Exit codes: 0 every selected check was proven or is allowed, 1 at least one was
 not proven, 2 a process could not be started or a file could not be written, 3
 refused (the baseline test run failed, the registry could not be loaded, or two
-checks share an id), 4 nothing was checked, 64 usage error, 70 an unexpected
+ids share an id or a function), 4 nothing was checked, 64 usage error, 70 an unexpected
 crash, which is never a finding.
 """
 
@@ -180,6 +180,12 @@ def parse_ids(text):
     return json.loads(value) if value is not None else None
 
 
+def parse_shared(text):
+    """The ids the child said share a function, or an empty list."""
+    value = find_marker(text, "SHARED")
+    return json.loads(value) if value is not None else []
+
+
 def duplicate_ids(ids):
     """Every id that appears more than once, in first-seen order."""
     seen, repeated = set(), []
@@ -301,6 +307,14 @@ def entries_of(registry):
     return entries
 
 
+def shared_ids(entries):
+    """Every id whose function is also another id's. Stubbing the function stubs them all."""
+    owners = {}
+    for ident, func in entries:
+        owners.setdefault(id(getattr(func, "__func__", func)), []).append(ident)
+    return [ident for group in owners.values() if len(group) > 1 for ident in group]
+
+
 def resolve_registry(spec):
     """Import module:NAME (NAME may be dotted) and read the checks out of it."""
     module_name, _, attr = spec.partition(":")
@@ -376,6 +390,7 @@ def child_main(argv):
             return 1
         if mode == "list":
             _marker("IDS", json.dumps([ident for ident, _func in entries]))
+            _marker("SHARED", json.dumps(shared_ids(entries)))
             return 0
         try:
             apply_stub(dict(entries)[check_id], check_id, parse_stub_value(job["value"]))
@@ -535,6 +550,14 @@ def _run(argv):
             print("      A stub for an id two entries share cannot say which entry a test needs.")
             print("\nVERDICT: REFUSED")
             return EXIT_REFUSED
+        shared = parse_shared(text)
+        if shared:
+            print("REFUSED   the registry is not unique, so nothing was stubbed")
+            print("      id(s) that share one function: %s" % ", ".join(shared))
+            print("      A stub for that function stubs every one of them, so a test for one "
+                  "would prove the others.")
+            print("\nVERDICT: REFUSED")
+            return EXIT_REFUSED
         missing = unknown_ids(args.only + args.allow, ids)
         if missing:
             return _usage("not registered: %s" % ", ".join(missing))
@@ -592,7 +615,8 @@ def _run(argv):
             print("\nCheck only. %s was not written. Re-run with --apply." % args.out)
         else:
             try:
-                with open(args.out, "w") as handle:
+                # "x" refuses a file that appeared while the tests ran.
+                with open(args.out, "x") as handle:
                     handle.write(render_report(results, counts))
             except (IOError, OSError) as exc:
                 print("error: %s" % exc, file=sys.stderr)
@@ -792,6 +816,15 @@ def _self_test(tmp):
             sys.modules.pop(_PROBE, None)
         return code, out.getvalue()
 
+    # ---- the test helper that sets and restores environment variables
+    with environ(DEADCHECK_PROBE_VAR="outer"):
+        with environ(DEADCHECK_PROBE_VAR="inner"):
+            inside = os.environ.get("DEADCHECK_PROBE_VAR")
+        restored = os.environ.get("DEADCHECK_PROBE_VAR")
+    check(inside == "inner" and restored == "outer"
+          and "DEADCHECK_PROBE_VAR" not in os.environ,
+          "the environment helper puts back a value it replaced and removes one it added")
+
     # ---- the stub: what it is made of
     check(parse_stub_value("[]") == [] and parse_stub_value("None") is None
           and parse_stub_value("{'a': 1}") == {"a": 1},
@@ -845,6 +878,13 @@ def _self_test(tmp):
     check(duplicate_ids(["a", "b", "a", "a", "c", "b"]) == ["a", "b"],
           "a repeated id is listed once, in first-seen order")
     check(duplicate_ids(["a", "b"]) == [], "a unique list repeats nothing")
+    holder_a, holder_b = targets["Holder"](), targets["Holder"]()
+    check(shared_ids([("A", f_one), ("B", f_one), ("C", f_two)]) == ["A", "B"]
+          and shared_ids([("A", holder_a.method), ("B", holder_b.method)]) == ["A", "B"]
+          and shared_ids([("A", f_one), ("B", f_two)]) == [],
+          "ids whose function is one and the same function are named, bound methods too")
+    check(parse_shared('DEADCHECK-SHARED ["A"]') == ["A"] and parse_shared("x") == [],
+          "the shared ids are read from the marker and empty when there is none")
     check(unknown_ids(["a", "z"], ["a", "b"]) == ["z"], "an id the registry lacks is named")
     check(check_command([]) is not None and check_command(["-m"]) is not None
           and check_command(["-m", "unittest"]) is None and check_command(["t.py"]) is None,
@@ -1046,6 +1086,13 @@ def _self_test(tmp):
     code, out, err = cli(base + ["--only", "RULE-01", "--out",
                                  os.path.join(tmp, "nodir", "r.json"), "--apply"] + unit)
     check(code == 2 and "error:" in err, "a report that cannot be written exits 2")
+    appearing = make("appearing", {
+        "reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n",
+        "t_make.py": "open(%r, 'a').close()\n" % os.path.join(tmp, "late.json")})
+    code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", appearing, "--out",
+                          os.path.join(tmp, "late.json"), "--apply", "--", "t_make.py"])
+    check(code == 2 and "error:" in err and os.path.getsize(os.path.join(tmp, "late.json")) == 0,
+          "a report file that appears while the tests run is not replaced, exit 2")
     code, out, err = cli(base + ["--apply"] + unit)
     check(code == 64 and "--apply needs --out" in err, "--apply without --out is a usage error")
 
@@ -1096,6 +1143,12 @@ def _self_test(tmp):
     code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", dupes, "--", "-m", "unittest"])
     check(code == 3 and "id(s) on more than one entry: X" in out and "RULE" not in out,
           "two checks with one id are REFUSED before anything is stubbed  <-- pinned defect")
+    aliased = make("aliased", {
+        "reg.py": "def a(r): return []\nCHECKS = {'X': a, 'Y': a, 'Z': lambda r: []}\n"})
+    code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", aliased, "--", "-m", "unittest"])
+    check(code == 3 and "share one function: X, Y" in out and "Z" not in out.split("function:")[1],
+          "two ids on one function are REFUSED, a stub for one would prove the other"
+          "  <-- pinned defect")
     empty = make("empty", {"reg.py": "CHECKS = {}\n"})
     code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", empty, "--", "-m", "unittest"])
     check(code == 4 and "NOTHING CHECKED" in out,
@@ -1148,6 +1201,16 @@ def _self_test(tmp):
     code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", quitter, "--", "t_quit.py"])
     check(code == 1 and "UNKNOWN      A" in out,
           "tests that end without reporting are UNKNOWN even at exit 0")
+
+    grandchild = make("grandchild", {
+        "reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n",
+        "t_sub.py": "import subprocess, sys\n"
+                    "out = subprocess.run([sys.executable, '-c', 'import reg; "
+                    "print(reg.CHECKS[\"A\"](0))'], stdout=subprocess.PIPE).stdout\n"
+                    "assert out.strip() == b'[1]', out\n"})
+    code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", grandchild, "--", "t_sub.py"])
+    check(code == 1 and "UNCALLED     A" in out,
+          "a test that runs the check in a new Python process of its own leaves it UNCALLED")
 
     slow_baseline = make("slow", {
         "reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n",
