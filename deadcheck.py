@@ -11,19 +11,20 @@ a branch nothing reaches, passes it too. Nothing is red, and the check is dead.
 This stubs one registered check at a time so that it returns nothing, runs your
 test command in a child process, and reports what happened:
 
-    PROVEN       the stub was called and the tests failed: a test needs it to fire
+    PROVEN       the stub was called and the tests failed, and passed with the
+                 real check: a test needs it to fire
     SURVIVED     the stub was called and the tests still passed: a test runs the
                  check and asserts nothing about what it found
     UNCALLED     the tests passed and never called the stub: no test runs it
-    SUSPECT      the tests failed but never called the stub: not this check's failure
+    SUSPECT      the tests failed, but not because of what the check returned:
+                 the stub was never called, or they failed with the real check too
     TIMEOUT      the tests ran past --timeout
     UNKNOWN      the tests ended before they could report whether the stub was called
     UNSTUBBABLE  the check is not a plain Python function, so it was not stubbed
 
 The stub replaces the function's code object, so a test that imports the
 function directly is stubbed as well as a test that goes through the registry.
-No fork, no signal and no file is used, so it runs the same on Windows as on
-Linux. The tests run in a child Python process by runpy, so any
+No fork and no signal is used, so it runs the same on Windows as on Linux. The tests run in a child Python process by runpy, so any
 "-m module args" or "script.py args" that Python can run will do.
 
     python deadcheck.py --self-test
@@ -38,7 +39,8 @@ Linux. The tests run in a child Python process by runpy, so any
 The obvious tools mutate a program's operators and report the mutants your tests
 miss. mutmut and Cosmic Ray do that, and do it far more thoroughly. This asks the
 one narrower question the registry asks of itself, once per check, and keeps the
-answer per check id. Nothing is written without --apply.
+answer per check id. The tool writes its report only with --apply; your tests
+may write files of their own.
 
 Exit codes: 0 every selected check was proven or is allowed, 1 at least one was
 not proven, 2 a process could not be started or a file could not be written, 3
@@ -57,6 +59,7 @@ import importlib.util
 import inspect
 import io
 import json
+import math
 import os
 import re
 import runpy
@@ -64,6 +67,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import types
 import warnings
@@ -98,8 +102,23 @@ EXIT_CRASH = 70
 # The child prints its answers as marker lines. The tests print what they like
 # around them, so the parent looks for these and nothing else.
 _PROBE = "_deadcheck_probe"
-_ENTRY = "import sys; sys.path.insert(0, sys.argv.pop(1)); import %s as m; " \
-         "sys.path.pop(0); sys.modules.pop(%r); sys.exit(m.child_main(sys.argv[1:]))"
+
+# The child loads this file by path under a fixed name, so the file may be called
+# anything, and it drops the current folder from the path first, so a project file
+# called json.py cannot stand in for the standard library inside the tool.
+_ENTRY = ("import sys; sys.path[:1] = [p for p in sys.path[:1] if p]; "
+          "import importlib.util as u; s = u.spec_from_file_location('deadcheck', "
+          "sys.argv.pop(1)); m = u.module_from_spec(s); s.loader.exec_module(m); "
+          "sys.exit(m.child_main(sys.argv[1:]))")
+
+# The empty value of each type a check may return, as a literal. A check that
+# returns something else has no empty value the tool can guess.
+EMPTY_OF = {"list": "[]", "dict": "{}", "tuple": "()", "set": "set()", "str": "''",
+            "bytes": "b''", "NoneType": "None"}
+
+# Ten years. A larger --timeout means "no limit" in practice and overflows the
+# operating system's wait call on some hosts, so it is cut to this.
+MAX_TIMEOUT = 10 * 365 * 24 * 3600.0
 
 
 class Unstubbable(Exception):
@@ -118,17 +137,55 @@ def parse_stub_value(text):
         # (1e999 prints as inf) would fail inside the tests, for the wrong reason.
         ast.literal_eval(repr(value))
         return value
-    except (ValueError, SyntaxError):
+    except (ValueError, SyntaxError, TypeError, RecursionError, MemoryError):
         raise ValueError("--stub-value must be one Python literal such as [], None or {}; "
                          "got %r" % text)
 
 
-def stub_source(free_count, check_id, value, generator=False):
+def signature_of(code):
+    """(parameters, call) texts that repeat the parameters of a code object.
+
+    The stub must take exactly the arguments the check takes. A test that reads
+    the signature of a registered check (a contract test, a plugin loader) would
+    fail on a stub that takes (*args, **kwargs), and that failure would read as
+    "a test needs this check to fire". Defaults live on the function object, not
+    on the code, so they survive the swap and are not repeated here.
+    """
+    names, positional = code.co_varnames, code.co_argcount
+    keyword_only = code.co_kwonlyargcount
+    params, call = [], []
+    for index in range(positional):
+        params.append(names[index])
+        call.append(names[index])
+        if index + 1 == code.co_posonlyargcount:
+            params.append("/")
+    cursor = positional + keyword_only
+    if code.co_flags & inspect.CO_VARARGS:
+        params.append("*" + names[cursor])
+        call.append("*" + names[cursor])
+        cursor += 1
+    elif keyword_only:
+        params.append("*")
+    for name in names[positional:positional + keyword_only]:
+        params.append(name)
+        call.append("%s=%s" % (name, name))
+    if code.co_flags & inspect.CO_VARKEYWORDS:
+        params.append("**" + names[cursor])
+        call.append("**" + names[cursor])
+    return ", ".join(params), ", ".join(call)
+
+
+def stub_source(free_count, check_id, value, generator=False, params="*args, **kwargs",
+                call="*args, **kwargs", passthrough=False):
     """Source of a function that records one call and returns value.
 
     A generator check gets a generator stub that yields nothing, because Python
     deprecates giving a generator function the code of a plain function. Its
     value is ignored.
+
+    A passthrough stub returns what the real check returns instead. It records
+    the type of each result, so the parent can tell a failure the return value
+    caused from one it did not. The real check is the copy in probe.originals.
 
     The function needs as many free variables as the check it replaces, because
     Python refuses to give a function a code object with a different count. The
@@ -138,13 +195,20 @@ def stub_source(free_count, check_id, value, generator=False):
     names = ["_free%d" % n for n in range(free_count)]
     if names:
         lines.append("    %s = None" % " = ".join(names))
-    lines.append("    def _stub(*args, **kwargs):")
+    lines.append("    def _stub(%s):" % params)
     if names:
         lines.append("        if 0:")
         lines.extend("            %s" % name for name in names)
-    lines.append("        probe = __import__('sys').modules[%r]" % _PROBE)
-    lines.append("        probe.hits[%r] = probe.hits.get(%r, 0) + 1" % (check_id, check_id))
-    if generator:
+    lines.append("        _dc = __import__('sys').modules[%r]" % _PROBE)
+    lines.append("        _dc.hits[%r] = _dc.hits.get(%r, 0) + 1" % (check_id, check_id))
+    if passthrough and generator:
+        lines.append("        yield from _dc.originals[%r](%s)" % (check_id, call))
+    elif passthrough:
+        lines.append("        _dc_result = _dc.originals[%r](%s)" % (check_id, call))
+        lines.append("        _dc.returns.setdefault(%r, set()).add(type(_dc_result).__name__)"
+                     % check_id)
+        lines.append("        return _dc_result")
+    elif generator:
         lines.append("        if 0:")
         lines.append("            yield")
     else:
@@ -153,11 +217,12 @@ def stub_source(free_count, check_id, value, generator=False):
     return "\n".join(lines) + "\n"
 
 
-def build_stub_code(free_count, check_id, value, generator=False):
+def build_stub_code(free_count, check_id, value, generator=False, params="*args, **kwargs",
+                    call="*args, **kwargs", passthrough=False):
     """The code object for a stub with free_count free variables."""
     namespace = {}
-    exec(compile(stub_source(free_count, check_id, value, generator), "<deadcheck-stub>",
-                 "exec"),
+    exec(compile(stub_source(free_count, check_id, value, generator, params, call,
+                             passthrough), "<deadcheck-stub>", "exec"),
          namespace)
     return namespace["_outer"]().__code__
 
@@ -172,6 +237,12 @@ def parse_hits(text):
     """How many times the stub ran, as the child reported it, or None."""
     value = find_marker(text, "HITS")
     return int(value) if value is not None and value.isdigit() else None
+
+
+def parse_returns(text):
+    """The type names a passed-through check returned, as the child reported them."""
+    value = find_marker(text, "RETURNS")
+    return json.loads(value) if value is not None else []
 
 
 def parse_ids(text):
@@ -210,11 +281,34 @@ def check_command(command):
     return None
 
 
-def classify(returncode, hits, timed_out, unstubbable):
+def normalize_exit(code):
+    """An exit status that stays non-zero after the operating system keeps 8 bits of it.
+
+    Linux reports sys.exit(256) as 0, so a failed run would read as a pass.
+    """
+    return 1 if code and not code % 256 else code
+
+
+def fit_stub(returned):
+    """(literal, problem) for a check whose real results had these type names.
+
+    literal is the empty value to stub with instead of the default, or None to
+    keep the default. problem is why no empty value can be chosen, or None.
+    """
+    if not returned or "list" in returned:
+        return None, None
+    if len(returned) == 1 and returned[0] in EMPTY_OF:
+        return EMPTY_OF[returned[0]], None
+    return None, ("it returns %s, which has no empty value the tool can guess"
+                  % ", ".join(returned))
+
+
+def classify(returncode, hits, timed_out, unstubbable, control_ok=True):
     """The status of one stubbed run. The order of the tests matters.
 
     A run that failed without calling the stub proves nothing about the check,
-    and neither does a run that could not say how often it called it.
+    and neither does a run that could not say how often it called it. A run that
+    also fails when the real check is passed through failed for another reason.
     """
     if unstubbable:
         return UNSTUBBABLE
@@ -224,11 +318,16 @@ def classify(returncode, hits, timed_out, unstubbable):
         return UNKNOWN
     if returncode == 0:
         return SURVIVED if hits > 0 else UNCALLED
-    return PROVEN if hits > 0 else SUSPECT
+    if hits > 0:
+        return PROVEN if control_ok else SUSPECT
+    return SUSPECT
 
 
 def explain(status, returncode, hits, timeout, reason):
     """One line saying what the status means for this run."""
+    if status == SUSPECT and hits:
+        return ("the tests failed (exit %s) with the stub and also with the real check "
+                "passed through, so the failure is not what the check returned" % returncode)
     if status == PROVEN:
         return ("stub called %d time(s) and the tests failed (exit %s)"
                 % (hits, returncode))
@@ -256,8 +355,12 @@ def summarize(results):
     return counts
 
 
-def verdict(results, allow):
-    """(exit code, lines) for a list of results and the ids allowed to stay unproven."""
+def verdict(results, allow, registered=None):
+    """(exit code, lines) for a list of results and the ids allowed to stay unproven.
+
+    registered is how many checks the registry holds. When --only picked fewer,
+    the verdict says so, because exit 0 then covers only the picked ones.
+    """
     total = len(results)
     if not total:
         return EXIT_NOTHING, [
@@ -268,17 +371,20 @@ def verdict(results, allow):
     stale = [r["id"] for r in results if r["status"] == PROVEN and r["id"] in allow]
     proven = sum(1 for r in results if r["status"] == PROVEN)
     lines = []
+    partial = ""
+    if registered and registered > total:
+        partial = " Only %d of %d registered check(s) were selected." % (total, registered)
     if waived:
         lines.append("allowed to stay unproven: %s" % ", ".join(waived))
     if stale:
         lines.append("allowed but proven, drop them from --allow: %s" % ", ".join(stale))
     if unproven:
         lines.append("VERDICT: %d of %d check(s) proven able to fire, %d not proven: %s. "
-                     "A check no test needs to fire may be unable to fire."
-                     % (proven, total, len(unproven), ", ".join(unproven)))
+                     "A check no test needs to fire may be unable to fire.%s"
+                     % (proven, total, len(unproven), ", ".join(unproven), partial))
         return EXIT_NOT_PROVEN, lines
-    lines.append("VERDICT: %d of %d check(s) proven able to fire, %d allowed unproven."
-                 % (proven, total, len(waived)))
+    lines.append("VERDICT: %d of %d check(s) proven able to fire, %d allowed unproven.%s"
+                 % (proven, total, len(waived), partial))
     return EXIT_OK, lines
 
 
@@ -326,8 +432,11 @@ def resolve_registry(spec):
     return entries_of(obj)
 
 
-def apply_stub(func, check_id, value):
+def apply_stub(func, check_id, value, passthrough=False):
     """Replace the code of func so it records a call and returns value.
+
+    With passthrough the stub returns what the real check returns, which is
+    kept as a copy in the probe, so a run can be repeated with the check intact.
 
     shortcut: a callable object, a functools.partial or a builtin has no code to
     replace, so it is refused here instead of being stubbed some other way.
@@ -339,8 +448,15 @@ def apply_stub(func, check_id, value):
     if inspect.iscoroutinefunction(target) or inspect.isasyncgenfunction(target):
         raise Unstubbable("an async function awaits its result, so a stub that "
                           "returns a plain value would fail for the wrong reason")
-    target.__code__ = build_stub_code(len(target.__code__.co_freevars), check_id, value,
-                                      inspect.isgeneratorfunction(target))
+    original = target.__code__
+    if passthrough:
+        # The stub passes every parameter on, so the copy needs no defaults of its own.
+        sys.modules[_PROBE].originals[check_id] = types.FunctionType(
+            original, target.__globals__, target.__name__, None, target.__closure__)
+    params, call = signature_of(original)
+    target.__code__ = build_stub_code(len(original.co_freevars), check_id, value,
+                                      inspect.isgeneratorfunction(target), params, call,
+                                      passthrough)
 
 
 def _marker(name, text):
@@ -364,7 +480,7 @@ def run_target(argv):
         if exc.code is None:
             return 0
         if isinstance(exc.code, int):
-            return exc.code
+            return normalize_exit(exc.code)
         print(exc.code, file=sys.stderr)
         return 1
     except Exception:
@@ -379,7 +495,7 @@ def child_main(argv):
     if job["argv"][0] != "-m":
         sys.path.insert(0, os.path.dirname(os.path.abspath(job["argv"][0])))
     probe = types.ModuleType(_PROBE)
-    probe.hits = {}
+    probe.hits, probe.originals, probe.returns = {}, {}, {}
     sys.modules[_PROBE] = probe
     mode, check_id = job["mode"], job.get("id")
     if mode != "baseline":
@@ -393,12 +509,14 @@ def child_main(argv):
             _marker("SHARED", json.dumps(shared_ids(entries)))
             return 0
         try:
-            apply_stub(dict(entries)[check_id], check_id, parse_stub_value(job["value"]))
+            apply_stub(dict(entries)[check_id], check_id, parse_stub_value(job["value"]),
+                       mode == "control")
         except Unstubbable as exc:
             _marker("UNSTUBBABLE", str(exc))
             return 1
     code = run_target(job["argv"])
     _marker("HITS", str(probe.hits.get(check_id, 0)))
+    _marker("RETURNS", json.dumps(sorted(probe.returns.get(check_id, ()))))
     return code
 
 
@@ -406,26 +524,42 @@ def child_main(argv):
 # The parent side: start the children, print, write the report.
 # =============================================================================
 
+def resolve_python(python):
+    """The interpreter as a path that means the same in every folder.
+
+    A relative path with a folder in it (.venv/bin/python) would be read against
+    the parent's folder on Windows and against --cwd on Linux. A bare name such as
+    python3 stays a PATH lookup.
+    """
+    return os.path.abspath(python) if os.path.dirname(python) else python
+
+
 def run_child(python, job, cwd, timeout):
-    """Run one job in a fresh Python. Returns (exit code, text, timed out)."""
-    here = os.path.abspath(__file__)
-    stem = os.path.splitext(os.path.basename(here))[0]
+    """Run one job in a fresh Python. Returns (exit code, text, timed out).
+
+    The output goes to an unnamed temporary file, not a pipe. With a pipe the wait
+    for the end of the output lasts as long as any process the tests started and
+    left running, so --timeout could not end the run.
+    """
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    command = [python, "-c", _ENTRY % (stem, stem), os.path.dirname(here), json.dumps(job)]
-    try:
-        done = subprocess.run(command, cwd=cwd, env=env, timeout=timeout,
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    except subprocess.TimeoutExpired:
-        return None, "", True
-    return done.returncode, done.stdout.decode("utf-8", "replace"), False
+    env["PYTHONIOENCODING"] = "utf-8:replace"
+    command = [python, "-c", _ENTRY, os.path.abspath(__file__), json.dumps(job)]
+    with tempfile.TemporaryFile() as sink:
+        try:
+            done = subprocess.run(command, cwd=cwd, env=env, timeout=timeout,
+                                  stdout=sink, stderr=subprocess.STDOUT)
+        except subprocess.TimeoutExpired:
+            return None, "", True
+        sink.seek(0)
+        return done.returncode, sink.read().decode("utf-8", "replace"), False
 
 
 def tail_of(text, count):
     """The last count non-blank lines, each cut to 160 characters."""
     lines = [line.rstrip()[:160] for line in text.splitlines()
              if line.strip() and not line.startswith("DEADCHECK-")]
-    return lines[len(lines) - count:] if count else []
+    return lines[-count:] if count else []
 
 
 def _tolerate_odd_characters():
@@ -448,7 +582,7 @@ def _parse(argv):
                     "out and running your tests.",
         epilog="Put the test command after --, for example: "
                "deadcheck.py --registry checks:CHECKS -- -m unittest discover. "
-               "Nothing is written without --apply.")
+               "The tool writes its report only with --apply; your tests may write files.")
     ap.add_argument("command", nargs="*",
                     help="the test command, as '-m module args' or 'script args', after --")
     ap.add_argument("--registry", metavar="MODULE:NAME",
@@ -458,22 +592,24 @@ def _parse(argv):
                     help="directory to run in and to import from (default .)")
     ap.add_argument("--python", default=sys.executable,
                     help="the Python that runs the tests (default: this one)")
-    ap.add_argument("--stub-value", dest="stub_value", default=DEFAULT_STUB_VALUE,
-                    help="what a stubbed check returns, as a Python literal "
-                         "(default %s)" % DEFAULT_STUB_VALUE)
+    ap.add_argument("--stub-value", dest="stub_value", default=None,
+                    help="what a stubbed check returns, as a Python literal. Default: %s, "
+                         "or the empty value of the type the check really returns"
+                         % DEFAULT_STUB_VALUE)
     ap.add_argument("--only", action="append", default=[], metavar="ID",
                     help="stub only this check. Repeat to name more.")
     ap.add_argument("--allow", action="append", default=[], metavar="ID",
                     help="a check that may stay unproven without failing the run. "
                          "Repeat to name more.")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
-                    help="seconds one test run may take (default %d)" % DEFAULT_TIMEOUT)
+                    help="seconds one test run may take, above zero and finite "
+                         "(default %d)" % DEFAULT_TIMEOUT)
     ap.add_argument("--tail", type=int, default=0,
                     help="print this many last lines of the test output under a "
                          "SUSPECT or UNKNOWN check (default 0, none)")
     ap.add_argument("--out", help="write the report as JSON to this new file. Needs --apply.")
     ap.add_argument("--apply", action="store_true",
-                    help="actually write --out. Without it nothing is written.")
+                    help="actually write --out. Without it the tool writes no report.")
     ap.add_argument("--self-test", dest="self_test", action="store_true",
                     help="run the offline assertions and exit")
     return ap.parse_args(argv)
@@ -490,6 +626,47 @@ def main(argv=None):
               "finding about your checks." % (type(exc).__name__, exc), file=sys.stderr)
         traceback.print_exc()
         return EXIT_CRASH
+
+
+def _check_one(args, base, cwd, ident):
+    """(result, output text) for one check.
+
+    The stubbed run decides first. A run that looks PROVEN is checked twice
+    more, because a failure is only the check's when the stub's return value
+    caused it. A control run passes the real result through: if the tests fail
+    then too, the failure was something else (a flaky test, state a second run
+    leaves behind). A check whose real results are not lists is stubbed again
+    with the empty value of its own type, because [] would crash the caller and
+    that crash would read as "a test needs this check".
+    """
+    def run(mode, **extra):
+        return run_child(args.python, dict(base, mode=mode, id=ident, **extra), cwd,
+                         args.timeout)
+
+    code, text, timed_out = run("run")
+    reason = find_marker(text, "UNSTUBBABLE")
+    hits = parse_hits(text)
+    status = classify(code, hits, timed_out, reason is not None)
+    why, note = None, ""
+    if status == PROVEN:
+        control_code, control_text, control_timed_out = run("control")
+        control_ok = (control_code == 0 and not control_timed_out
+                      and (parse_hits(control_text) or 0) > 0)
+        status = classify(code, hits, timed_out, False, control_ok)
+        literal = problem = None
+        if status == PROVEN and not args.stub_value:
+            literal, problem = fit_stub(parse_returns(control_text))
+        if problem:
+            status = SUSPECT
+            why = ("the tests failed with the default stub %s, and %s, so the failure may "
+                   "come from the wrong type. Pass --stub-value" % (DEFAULT_STUB_VALUE, problem))
+        elif literal:
+            code, text, timed_out = run("run", value=literal)
+            hits = parse_hits(text)
+            status = classify(code, hits, timed_out, False)
+            note = " (stub value %s, the empty value of the type the check returns)" % literal
+    why = why or explain(status, code, hits, args.timeout, reason) + note
+    return {"id": ident, "status": status, "hits": hits, "exit": code, "why": why}, text
 
 
 def _usage(message):
@@ -512,8 +689,9 @@ def _run(argv):
     problem = check_command(args.command)
     if problem:
         return _usage(problem)
-    if args.timeout <= 0:
-        return _usage("--timeout must be above zero.")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        return _usage("--timeout must be a finite number above zero. Use a large number "
+                      "such as 1e9 for no limit.")
     if args.tail < 0:
         return _usage("--tail cannot be negative.")
     if args.apply and not args.out:
@@ -522,16 +700,21 @@ def _run(argv):
         # Checked on a dry run too, so a path that would replace a test file is
         # named before --apply is added, not after.
         return _usage("--out %s already exists. Name a new file." % args.out)
+    if args.out and not os.path.isdir(os.path.dirname(os.path.abspath(args.out))):
+        return _usage("--out %s is in a folder that does not exist. Create the folder "
+                      "first." % args.out)
     if not os.path.isdir(args.cwd):
         return _usage("--cwd %s is not a directory." % args.cwd)
     try:
-        value = parse_stub_value(args.stub_value)
+        value = parse_stub_value(args.stub_value or DEFAULT_STUB_VALUE)
     except ValueError as exc:
         return _usage(str(exc))
 
     cwd = os.path.abspath(args.cwd)
+    args.python = resolve_python(args.python)
+    args.timeout = min(args.timeout, MAX_TIMEOUT)
     base = {"cwd": cwd, "argv": args.command, "registry": args.registry,
-            "value": args.stub_value}
+            "value": args.stub_value or DEFAULT_STUB_VALUE}
     try:
         code, text, timed_out = run_child(args.python, dict(base, mode="list"), cwd,
                                           args.timeout)
@@ -586,16 +769,10 @@ def _run(argv):
 
         results = []
         for ident in chosen:
-            code, text, timed_out = run_child(args.python, dict(base, mode="run", id=ident),
-                                              cwd, args.timeout)
-            reason = find_marker(text, "UNSTUBBABLE")
-            hits = parse_hits(text)
-            status = classify(code, hits, timed_out, reason is not None)
-            why = explain(status, code, hits, args.timeout, reason)
-            results.append({"id": ident, "status": status, "hits": hits, "exit": code,
-                            "why": why})
-            print("%-12s %s  %s" % (status, ident, why))
-            if status in (SUSPECT, UNKNOWN):
+            result, text = _check_one(args, base, cwd, ident)
+            results.append(result)
+            print("%-12s %s  %s" % (result["status"], ident, result["why"]))
+            if result["status"] in (SUSPECT, UNKNOWN):
                 for line in tail_of(text, args.tail):
                     print("      | %s" % line)
     except OSError as exc:
@@ -607,7 +784,7 @@ def _run(argv):
     for status in STATUSES:
         print("  %-12s %d" % (status, counts[status]))
     print("")
-    exit_code, lines = verdict(results, args.allow)
+    exit_code, lines = verdict(results, args.allow, len(ids))
     for line in lines:
         print(line)
     if args.out:
@@ -665,6 +842,16 @@ class _Harness(object):
             return 1
         print("%d assertions, 0 failed" % total)
         return 0
+
+
+def _count_plainly(harness, ok, label):
+    """Record one result without check(), for a proof that check() itself works."""
+    if ok:
+        harness.passed += 1
+        print("PASS  %s" % label)
+    else:
+        harness.failed.append(label)
+        print("FAIL  %s" % label)
 
 
 # The synthetic project the self-test stubs. Six checks, one per behaviour.
@@ -753,6 +940,17 @@ def generator(rows):
 async def coroutine(rows): return []
 async def agen(rows):
     yield 1
+'''
+
+
+# Functions whose signatures the stub must repeat. Compiled from a string for the
+# same reason as _STUB_TARGETS.
+_SHAPE_TARGETS = '''\
+def shaped(a, b=2, /, c=3, *rest, d, e=5, **kw): return [a]
+def positional_only(a, /): return [a]
+def var_only(*args, **kwargs): return list(args)
+def keyword_only(*, k): return [k]
+def plain_args(rows): return rows
 '''
 
 
@@ -941,12 +1139,101 @@ def _self_test(tmp):
     check(tail_of("a\n\n b  \nc\nDEADCHECK-HITS 1\n", 2) == [" b", "c"] and tail_of("a\nb", 0) == []
           and tail_of("a\nb", 9) == ["a", "b"] and len(tail_of("x" * 400, 1)[0]) == 160,
           "the output tail skips blank lines and cuts long ones")
+    check(tail_of("a\nb\nc", 5) == ["a", "b", "c"] and tail_of("a\nb\nc", 3) == ["a", "b", "c"]
+          and tail_of("a\nb\nc", 2) == ["b", "c"],
+          "a tail longer than the output, but shorter than twice it, keeps the first lines"
+          "  <-- pinned defect")
+    check(render_report([res("A", PROVEN)], counts).startswith('{\n  "checks": [\n    {'),
+          "the report is indented and sorted, so two runs of one result diff cleanly")
+
+    # ---- the pure helpers added with the control run
+    check(parse_returns('x\nDEADCHECK-RETURNS ["dict", "list"]\n') == ["dict", "list"]
+          and parse_returns("nothing") == [],
+          "the types a passed-through check returned are read from the marker, empty when absent")
+    check(normalize_exit(0) == 0 and normalize_exit(3) == 3 and normalize_exit(-1) == -1
+          and normalize_exit(256) == 1 and normalize_exit(512) == 1 and normalize_exit(-256) == 1
+          and normalize_exit(257) == 257,
+          "an exit status that the operating system would cut to 0 stays non-zero"
+          "  <-- pinned defect")
+    check(fit_stub([]) == (None, None) and fit_stub(["list"]) == (None, None)
+          and fit_stub(["NoneType", "list"]) == (None, None),
+          "a check that returns a list, or was never seen returning, keeps the default stub")
+    check(fit_stub(["dict"]) == ("{}", None) and fit_stub(["NoneType"]) == ("None", None)
+          and fit_stub(["tuple"]) == ("()", None) and fit_stub(["set"]) == ("set()", None),
+          "a check that returns one other type is stubbed with the empty value of that type")
+    check(fit_stub(["int"])[0] is None and "int" in fit_stub(["int"])[1]
+          and "dict, str" in fit_stub(["dict", "str"])[1],
+          "a return type with no empty value, or several types, is named as a problem")
+    check([parse_stub_value(text) for text in EMPTY_OF.values()]
+          == [[], {}, (), set(), "", b"", None],
+          "every empty value the tool picks reads back as a literal")
+    check(classify(1, 2, False, False, False) == SUSPECT and classify(1, 2, False, False, True) == PROVEN
+          and classify(0, 2, False, False, False) == SURVIVED,
+          "a failure that also happens with the real check passed through is SUSPECT, "
+          "and only a failing run is held to that  <-- pinned defect")
+    check(explain(SUSPECT, 1, 2, 9, "") != explain(SUSPECT, 1, 0, 9, "")
+          and "passed through" in explain(SUSPECT, 1, 2, 9, "")
+          and "without calling the stub" in explain(SUSPECT, 1, 0, 9, ""),
+          "the two kinds of SUSPECT explain themselves differently")
+    for status, words in ((PROVEN, "stub called 2 time(s) and the tests failed (exit 1)"),
+                          (SURVIVED, "tests still passed: a test runs this check"),
+                          (UNCALLED, "never called the stub"), (TIMEOUT, "ran past 9 seconds"),
+                          (UNKNOWN, "ended before they reported")):
+        check(words in explain(status, 1, 2, 9, ""),
+              "a %s run says what happened, in words a reader can act on" % status)
+    code, lines = verdict([res("A", PROVEN), res("B", SURVIVED)], ["A"])
+    check(code == 1 and lines[0] == "allowed but proven, drop them from --allow: A",
+          "only a proven check is listed as a stale allowance")
+    code, lines = verdict([res("A", PROVEN)], [])
+    check(code == 0 and len(lines) == 1, "no allowed check, no 'allowed to stay unproven' line")
+    code, lines = verdict([res("A", PROVEN)], [], 4)
+    check(code == 0 and "Only 1 of 4 registered check(s) were selected." in lines[-1],
+          "a verdict over fewer checks than the registry holds says so, even at exit 0"
+          "  <-- pinned defect")
+    code, lines = verdict([res("A", UNCALLED)], [], 3)
+    check(code == 1 and lines[-1].endswith("Only 1 of 3 registered check(s) were selected."),
+          "the same note ends a verdict that fails")
+    code, lines = verdict([res("A", PROVEN)], [], 1)
+    check("Only" not in lines[-1], "a run over the whole registry carries no such note")
+    check(resolve_python("python3") == "python3"
+          and resolve_python(os.path.join("sub", "py")) == os.path.abspath(os.path.join("sub", "py"))
+          and os.path.isabs(resolve_python("./py")),
+          "an interpreter given with a folder is made absolute, a bare name stays a PATH lookup"
+          "  <-- pinned defect")
+    raises(lambda: parse_stub_value("{[]}"),
+           "a stub value that is a literal but cannot be built is refused, not a crash"
+           "  <-- pinned defect")
+    raises(lambda: parse_stub_value("[" * 5000), "a stub value nested without end is refused")
+
+    # ---- the stub takes the arguments the check takes
+    shapes = {}
+    exec(compile(_SHAPE_TARGETS, "<fixture shapes>", "exec"), shapes)
+    for name in ("shaped", "positional_only", "var_only", "keyword_only", "plain_args"):
+        func = shapes[name]
+        before = inspect.signature(func)
+        text = signature_of(func.__code__)
+        sys.modules[_PROBE] = types.ModuleType(_PROBE)
+        sys.modules[_PROBE].hits, sys.modules[_PROBE].originals = {}, {}
+        sys.modules[_PROBE].returns = {}
+        try:
+            apply_stub(func, name, [])
+        finally:
+            sys.modules.pop(_PROBE, None)
+        check(inspect.signature(func) == before and isinstance(text[0], str),
+              "a stubbed %s keeps its signature, so a test that reads it still passes"
+              "  <-- pinned defect" % name)
+    check(signature_of(shapes["shaped"].__code__) == (
+        "a, b, /, c, *rest, d, e, **kw", "a, b, c, *rest, d=d, e=e, **kw")
+          and signature_of(shapes["keyword_only"].__code__) == ("*, k", "k=k")
+          and signature_of(shapes["plain_args"].__code__) == ("rows", "rows"),
+          "the parameter text repeats positional-only, keyword-only, *args and **kwargs")
 
     # ---- apply_stub, in this process
     plain, Holder = targets["plain"], targets["Holder"]
     with_default, generator = targets["with_default"], targets["generator"]
     sys.modules[_PROBE] = types.ModuleType(_PROBE)
-    sys.modules[_PROBE].hits = {}
+    sys.modules[_PROBE].hits, sys.modules[_PROBE].originals = {}, {}
+    sys.modules[_PROBE].returns = {}
     try:
         apply_stub(plain, "P-1", [])
         check(plain([-1, -2]) == [] and sys.modules[_PROBE].hits == {"P-1": 1},
@@ -992,6 +1279,37 @@ def _self_test(tmp):
               "a builtin is refused with a reason")
         check("Holder" in refusal(Holder()), "a callable object is refused with a reason")
         check(refusal(targets["f_two"]) == "", "a plain function is not refused")
+
+        # a pass-through stub counts the call, records the result type and changes nothing else
+        fresh = {}
+        exec(compile(_STUB_TARGETS, "<fixture targets>", "exec"), fresh)
+        probe_now = sys.modules[_PROBE]
+        apply_stub(fresh["plain"], "T-1", [], passthrough=True)
+        check(fresh["plain"]([-1, 2]) == [-1] and probe_now.hits["T-1"] == 1
+              and probe_now.returns["T-1"] == {"list"},
+              "a pass-through stub returns the real result, counts the call and records its type")
+        apply_stub(fresh["with_default"], "T-2", [], passthrough=True)
+        check(fresh["with_default"]([1]) == [True, 3]
+              and fresh["with_default"]([1], False, extra=9) == [False, 9]
+              and probe_now.returns["T-2"] == {"list"},
+              "a pass-through stub forwards defaults, keyword-only arguments and keywords")
+        fresh_holder = fresh["Holder"]()
+        apply_stub(fresh_holder.method, "T-3", [], passthrough=True)
+        check(fresh_holder.method([-4]) == [-4],
+              "a pass-through stub on a method keeps self")
+        closure = fresh["outer"]()
+        apply_stub(closure, "T-4", [], passthrough=True)
+        check(closure([5]) == [-1, 5], "a pass-through stub on a closure keeps its free variable")
+        apply_stub(fresh["generator"], "T-5", [], passthrough=True)
+        check(list(fresh["generator"]([7, 8])) == [7, 8] and probe_now.hits["T-5"] == 1
+              and "T-5" not in probe_now.returns,
+              "a pass-through stub on a generator yields what the real one yields")
+        shaped_copy = {}
+        exec(compile(_SHAPE_TARGETS, "<fixture shapes>", "exec"), shaped_copy)
+        apply_stub(shaped_copy["shaped"], "T-6", [], passthrough=True)
+        check(shaped_copy["shaped"](1, 2, 3, 4, d=5, z=6) == [1],
+              "a pass-through stub forwards positional-only, extra positional and extra keyword "
+              "arguments")
     finally:
         sys.modules.pop(_PROBE, None)
 
@@ -1034,6 +1352,9 @@ def _self_test(tmp):
     code, out, err = cli(base + ["--only", "RULE-01", "--only", "RULE-04"] + unit)
     check(code == 0 and "2 selected" in out and "checks stubbed: 2 of 6" in out
           and "RULE-02" not in out, "--only stubs just the named checks")
+    check("Only 2 of 6 registered check(s) were selected." in out and "Check only" not in out,
+          "--only says on the verdict line that the exit status covers just the picked checks, "
+          "and no report note is printed when there is no --out")
     code, out, err = cli(base + ["--allow", "RULE-02", "--allow", "RULE-03",
                                  "--allow", "RULE-05", "--allow", "RULE-06"] + unit)
     check(code == 0 and "allowed to stay unproven: RULE-02, RULE-03, RULE-05, RULE-06" in out,
@@ -1085,7 +1406,12 @@ def _self_test(tmp):
           "  <-- pinned defect")
     code, out, err = cli(base + ["--only", "RULE-01", "--out",
                                  os.path.join(tmp, "nodir", "r.json"), "--apply"] + unit)
-    check(code == 2 and "error:" in err, "a report that cannot be written exits 2")
+    check(code == 64 and "folder that does not exist" in err and out == "",
+          "--out in a folder that is not there is a usage error on a dry run too, not exit 2 "
+          "after every check ran  <-- pinned defect")
+    code, out, err = cli(base + ["--only", "RULE-01", "--out",
+                                 os.path.join(tmp, "nodir", "r.json")] + unit)
+    check(code == 64 and out == "", "the same on a dry run, which would otherwise say it is fine")
     appearing = make("appearing", {
         "reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n",
         "t_make.py": "open(%r, 'a').close()\n" % os.path.join(tmp, "late.json")})
@@ -1231,6 +1557,214 @@ def _self_test(tmp):
     code, out, err = cli(base + ["--python", os.path.join(tmp, "no-such-python")] + unit)
     check(code == 2 and "could not start" in err, "an interpreter that cannot start exits 2")
 
+    # ---- a failure the stub's return value did not cause is not proof
+    signature = make("signature", {
+        "checks.py": "def dead_check(rows):\n    return [r['nmae'] for r in rows if r.get('x')]\n"
+                     "CHECKS = {'S-01': dead_check}\n",
+        "test_sig.py": "import inspect, unittest, checks\n"
+                       "class T(unittest.TestCase):\n"
+                       "    def test_signature(self):\n"
+                       "        for fn in checks.CHECKS.values():\n"
+                       "            self.assertEqual(list(inspect.signature(fn).parameters), "
+                       "['rows'])\n"
+                       "    def test_clean_sample(self):\n"
+                       "        self.assertEqual(checks.CHECKS['S-01']([{'y': 1}]), [])\n"})
+    code, out, err = cli(["--registry", "checks:CHECKS", "--cwd", signature, "--", "-m",
+                          "unittest", "discover", "-s", signature, "-t", signature])
+    check(code == 1 and status_of(out, "S-01") == SURVIVED,
+          "a test that reads the signature of a check does not turn a dead check PROVEN"
+          "  <-- pinned defect")
+
+    state_path = os.path.join(tmp, "state_flaky.txt")
+    stateful = make("stateful", {
+        "reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n",
+        "t_state.py": "import os, reg\n"
+                      "PATH = %r\n"
+                      "n = int(open(PATH).read()) if os.path.exists(PATH) else 0\n"
+                      "open(PATH, 'w').write(str(n + 1))\n"
+                      "reg.CHECKS['A']([1])\n"
+                      "print(os.environ.get('DEADCHECK_CANARY_SECRET_9f3a', 'no canary'))\n"
+                      "raise SystemExit(1 if n else 0)\n" % state_path})
+    code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", stateful, "--", "t_state.py"])
+    check(code == 1 and status_of(out, "A") == SUSPECT and "passed through" in out
+          and "PROVEN       0" in out,
+          "a suite that fails on every run after the first does not turn a dead check PROVEN"
+          "  <-- pinned defect")
+
+    shape = make("shape", {
+        "checks.py": "def dict_check(rows):\n    return {'found': [r for r in rows if r < 0]}\n"
+                     "def keyed_check(rows):\n    return {'findings': []}\n"
+                     "def none_check(rows):\n    return None\n"
+                     "def count_check(rows):\n    return len([r for r in rows if r < 0])\n"
+                     "CHECKS = {'D-01': dict_check, 'D-02': keyed_check, 'N-01': none_check,\n"
+                     "          'C-01': count_check}\n",
+        "test_shape.py": "import unittest, checks\n"
+                         "class T(unittest.TestCase):\n"
+                         "    def test_dict(self):\n"
+                         "        for key, value in checks.CHECKS['D-01']([1, 2]).items():\n"
+                         "            self.assertEqual(value, [])\n"
+                         "    def test_keyed(self):\n"
+                         "        self.assertEqual(checks.CHECKS['D-02']([1])['findings'], [])\n"
+                         "    def test_none(self):\n"
+                         "        self.assertIsNone(checks.CHECKS['N-01']([1, 2]))\n"
+                         "    def test_count(self):\n"
+                         "        self.assertEqual(checks.CHECKS['C-01']([1, 2]), 0)\n"})
+    shape_cmd = ["--", "-m", "unittest", "discover", "-s", shape, "-t", shape]
+    shape_base = ["--registry", "checks:CHECKS", "--cwd", shape]
+    code, out, err = cli(shape_base + shape_cmd)
+    check(status_of(out, "D-01") == SURVIVED and "stub value {}" in out,
+          "a check that returns a dict is stubbed with {}, not with a [] that crashes its caller"
+          "  <-- pinned defect")
+    check(status_of(out, "N-01") == SURVIVED and "stub value None" in out,
+          "a check that returns None is stubbed with None, not with a [] a test rejects"
+          "  <-- pinned defect")
+    check(status_of(out, "D-02") == PROVEN,
+          "a caller that indexes the empty dict still fails, which is read as PROVEN (a limit)")
+    check(status_of(out, "C-01") == SUSPECT and "Pass --stub-value" in out and code == 1,
+          "a check whose results have no empty value is SUSPECT and says to pass --stub-value")
+    code, out, err = cli(shape_base + ["--stub-value", "[]", "--only", "N-01"] + shape_cmd)
+    check(code == 0 and status_of(out, "N-01") == PROVEN,
+          "an explicit --stub-value is obeyed and never replaced by a guess")
+    code, out, err = cli(shape_base + ["--stub-value", "0", "--only", "C-01"] + shape_cmd)
+    check(code == 1 and status_of(out, "C-01") == SURVIVED,
+          "--stub-value 0 gives a count check the stub it needs")
+
+    # ---- processes the tests leave running must not hold the run
+    holder = make("holder", {
+        "reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n",
+        "t_hold.py": "import subprocess, sys, tempfile\n"
+                     "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(15)'],\n"
+                     "                 cwd=tempfile.gettempdir())\n",
+        "t_hold_slow.py": "import subprocess, sys, tempfile, time\n"
+                          "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(15)'],\n"
+                          "                 cwd=tempfile.gettempdir())\n"
+                          "time.sleep(60)\n"})
+    began = time.time()
+    code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", holder, "--", "t_hold.py"])
+    check(code == 1 and status_of(out, "A") == UNCALLED and time.time() - began < 10,
+          "a test that leaves a helper process running does not make the run wait for it"
+          "  <-- pinned defect")
+    began = time.time()
+    code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", holder, "--timeout", "3", "--",
+                          "t_hold_slow.py"])
+    check(code == 3 and "past 3.0 seconds" in out and time.time() - began < 10,
+          "--timeout ends the run even when a helper process still holds the output"
+          "  <-- pinned defect")
+
+    # ---- the exit status, the timeout and the paths the user types
+    exit256 = make("exit256", {"reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n",
+                               "t_256.py": "import sys\nsys.exit(256)\n"})
+    code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", exit256, "--", "t_256.py"])
+    check(code == 3 and "fails without any stub (exit 1)" in out,
+          "a test command that exits 256 is a failure, not the pass Linux reads in the low byte"
+          "  <-- pinned defect")
+    for bad in ("inf", "nan", "1e400"):
+        code, out, err = cli(["--registry", "checks:CHECKS", "--timeout", bad] + unit)
+        check(code == 64 and "finite" in err and out == "",
+              "--timeout %s is a usage error, not a crash at exit 70  <-- pinned defect" % bad)
+    code, out, err = cli(base + ["--timeout", "1e300", "--only", "RULE-01"] + unit)
+    check(code == 0 and status_of(out, "RULE-01") == PROVEN,
+          "a huge finite --timeout means no limit and does not overflow")
+
+    renamed = make("renamed", {})
+    renamed_tool = os.path.join(renamed, "dead-check.v2.py")
+    shutil.copyfile(os.path.abspath(__file__), renamed_tool)
+    done = subprocess.run([sys.executable, renamed_tool, "--registry", "checks:CHECKS", "--cwd",
+                           project, "--only", "RULE-01"] + unit,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    check(done.returncode == 0 and b"PROVEN       RULE-01" in done.stdout,
+          "the tool file may be called anything, such as dead-check.v2.py  <-- pinned defect")
+    shadow = make("shadow", {
+        "reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n",
+        "json.py": "x = 1\n",
+        "t_shadow.py": "import reg\nassert reg.CHECKS['A']([1]) == [1]\n"})
+    code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", shadow, "--", "t_shadow.py"])
+    check(code == 0 and status_of(out, "A") == PROVEN and "REFUSED" not in out,
+          "a project file called json.py does not stand in for the standard library inside "
+          "the tool  <-- pinned defect")
+    printer = make("printer", {
+        "reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n",
+        "t_print.py": "import reg\nprint(chr(10003))\nassert reg.CHECKS['A']([1]) == [1]\n"})
+    with environ(PYTHONIOENCODING="ascii"):
+        code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", printer, "--", "t_print.py"])
+    check(code == 0 and status_of(out, "A") == PROVEN,
+          "a test that prints a character the console cannot encode still runs  <-- pinned defect")
+
+    layout = make("layout", {"reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n"})
+    os.mkdir(os.path.join(layout, "pkg"))
+    os.mkdir(os.path.join(layout, "sub"))
+    write(os.path.join(layout, "pkg"), "__init__.py", "")
+    write(os.path.join(layout, "pkg"), "tmod.py",
+          "import unittest, reg\n"
+          "class T(unittest.TestCase):\n"
+          "    def test_a(self):\n"
+          "        self.assertEqual(reg.CHECKS['A']([1]), [1])\n"
+          "if __name__ == '__main__':\n"
+          "    unittest.main()\n")
+    write(os.path.join(layout, "sub"), "helper_mod.py", "VALUE = [1]\n")
+    write(os.path.join(layout, "sub"), "run_it.py",
+          "import helper_mod, reg\nassert reg.CHECKS['A']([1]) == helper_mod.VALUE\n")
+    code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", layout, "--", "-m", "pkg.tmod"])
+    check(code == 0 and status_of(out, "A") == PROVEN,
+          "-m package.module with unittest.main() at its end runs as __main__")
+    code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", layout, "--", "sub/run_it.py"])
+    check(code == 0 and status_of(out, "A") == PROVEN,
+          "a test script in a sub-folder can import the module next to it")
+
+    modalias = make("modalias", {
+        "t_alias.py": "import os, sys\n"
+                      "sys.path.insert(0, os.path.join(os.getcwd(), 'pkg'))\n"
+                      "import checks\n"
+                      "assert checks.rule([3, -2]) == [-2]\n"})
+    os.mkdir(os.path.join(modalias, "pkg"))
+    write(os.path.join(modalias, "pkg"), "__init__.py", "")
+    write(os.path.join(modalias, "pkg"), "checks.py",
+          "def rule(rows):\n    return [r for r in rows if r < 0]\nCHECKS = {'RULE-01': rule}\n")
+    code, out, err = cli(["--registry", "pkg.checks:CHECKS", "--cwd", modalias, "--",
+                          "t_alias.py"])
+    check(code == 1 and status_of(out, "RULE-01") == UNCALLED,
+          "a test that imports the source under a second module name runs another function "
+          "object, so the check is UNCALLED (a limit, pinned)")
+
+    unreached_state = os.path.join(tmp, "state_unreached.txt")
+    unreached = make("unreached", {
+        "reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n",
+        "t_unreached.py": "import os, reg\n"
+                          "PATH = %r\n"
+                          "n = int(open(PATH).read()) if os.path.exists(PATH) else 0\n"
+                          "open(PATH, 'w').write(str(n + 1))\n"
+                          "if n == 1:\n"
+                          "    raise SystemExit(0 if reg.CHECKS['A']([1]) == [1] else 1)\n"
+                          % unreached_state})
+    code, out, err = cli(["--registry", "reg:CHECKS", "--cwd", unreached, "--", "t_unreached.py"])
+    check(code == 1 and status_of(out, "A") == SUSPECT and "passed through" in out,
+          "a control run that never reached the check cannot clear the stub  <-- pinned defect")
+
+    leaky_state = os.path.join(tmp, "state_leaky.txt")
+    leaky = make("leaky", {
+        "reg.py": "def a(r): return [1]\nCHECKS = {'A': a}\n",
+        "t_leak.py": "import os, reg\n"
+                     "PATH = %r\n"
+                     "n = int(open(PATH).read()) if os.path.exists(PATH) else 0\n"
+                     "open(PATH, 'w').write(str(n + 1))\n"
+                     "reg.CHECKS['A']([1])\n"
+                     "print('token=' + os.environ['DEADCHECK_CANARY_SECRET_9f3a'])\n"
+                     "raise SystemExit(1 if n else 0)\n" % leaky_state})
+    os.environ["DEADCHECK_CANARY_SECRET_9f3a"] = "hunter2-canary"
+    try:
+        code, quiet_out, quiet_err = cli(["--registry", "reg:CHECKS", "--cwd", leaky, "--",
+                                          "t_leak.py"])
+        os.remove(leaky_state)
+        code, loud_out, loud_err = cli(["--registry", "reg:CHECKS", "--cwd", leaky, "--tail",
+                                        "3", "--", "t_leak.py"])
+    finally:
+        os.environ.pop("DEADCHECK_CANARY_SECRET_9f3a", None)
+    check("hunter2-canary" not in quiet_out + quiet_err and status_of(quiet_out, "A") == SUSPECT
+          and "hunter2-canary" in loud_out,
+          "a secret a test prints stays out of the output unless --tail asks for it, "
+          "and the assertion can fail: --tail 3 does print it")
+
     # ---- the child, in this process, so the lines it runs are measured. Its
     # registry lives in memory and its tests are stdlib or this file, so coverage
     # never traces a file that is deleted before it writes its report.
@@ -1309,6 +1843,12 @@ def _self_test(tmp):
     check(red_status == 1 and "5 assertions, 3 failed" in buf.getvalue()
           and "  FAILED: probe one" in buf.getvalue(),
           "the footer reports failures by count and by name, and exits 1  <-- pinned defect")
+    plain_probe = _Harness()
+    with contextlib.redirect_stdout(io.StringIO()):
+        _count_plainly(plain_probe, True, "plain one")
+        _count_plainly(plain_probe, False, "plain two")
+    check(plain_probe.passed == 1 and plain_probe.failed == ["plain two"],
+          "the plain counter used to prove check() records a pass and a failure by itself")
     with contextlib.redirect_stdout(io.StringIO()) as quiet_out:
         zero = _Harness().footer()
     check(zero == 0 and "0 assertions, 0 failed" in quiet_out.getvalue(),
@@ -1353,6 +1893,7 @@ def _self_test(tmp):
         artefact = handle.read()
     check("hunter2-canary" not in out + err + artefact and canary not in out + err + artefact,
           "an environment secret reaches neither stdout, stderr nor the report")
+    check("      | " not in out, "--tail prints test output only under a SUSPECT or UNKNOWN check")
     check(not [n for n in os.listdir(project) if n.endswith(".pyc") or n == "__pycache__"],
           "after every run the project folder holds no bytecode")
 
@@ -1384,7 +1925,28 @@ def _self_test(tmp):
     check(buf.getvalue() == "" and imported.classify(1, 1, False, False) == PROVEN,
           "importing the module prints nothing and exposes the core")
 
-    return harness.footer()
+    # ---- the harness, proved from outside. check() cannot vouch for itself, so
+    # this counts a result with plain code and reads the exit status of a real process.
+    driver = ("import sys, importlib.util as u\n"
+              "s = u.spec_from_file_location('deadcheck', sys.argv[1])\n"
+              "m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+              "h = m._Harness(); h.check(sys.argv[2] == 'good', 'deliberate')\n"
+              "m._self_test = lambda tmp: (h.footer(), h)[1]\n"
+              "sys.exit(m.main(['--self-test']))\n")
+    for mode, want_code, want_text, label in (
+            ("bad", 1, "1 assertions, 1 failed",
+             "a self-test with a failed assertion exits 1 and names it  <-- pinned defect"),
+            ("good", 0, "1 assertions, 0 failed",
+             "a self-test with only passed assertions exits 0")):
+        done = subprocess.run([sys.executable, "-c", driver, os.path.abspath(__file__), mode],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=tmp,
+                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        shown = done.stdout.decode("utf-8", "replace")
+        _count_plainly(harness, done.returncode == want_code and want_text in shown
+                       and (mode == "good" or "FAILED: deliberate" in shown), label)
+
+    harness.footer()
+    return harness
 
 
 def _capture_marker(name, text):
@@ -1402,7 +1964,8 @@ def self_test():
     print("-" * 68)
     tmp = tempfile.mkdtemp(prefix="deadcheck-selftest-")
     try:
-        return _self_test(tmp)
+        # Decided from the failures themselves, not from what footer() returns.
+        return 1 if _self_test(tmp).failed else 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
